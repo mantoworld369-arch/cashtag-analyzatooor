@@ -1,5 +1,4 @@
 import express from "express";
-import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -7,12 +6,80 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-app.use(express.json());
-
-// Serve the built frontend
+app.use(express.json({ limit: "5mb" }));
 app.use(express.static(join(__dirname, "dist")));
 
-// ── Proxy: Twitter API ───────────────────────────────────────────────────────
+// ── Paginated Twitter fetch ──────────────────────────────────────────────────
+
+async function fetchGetXAPIPages(query, apiKey, maxPages = 5) {
+  let allTweets = [];
+  let cursor = "";
+
+  for (let i = 0; i < maxPages; i++) {
+    const url = `https://api.getxapi.com/twitter/tweet/advanced_search?q=${encodeURIComponent(query)}&product=Latest${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+
+    if (!resp.ok) {
+      if (i === 0) {
+        const errText = await resp.text();
+        throw new Error(`GetXAPI error ${resp.status}: ${errText}`);
+      }
+      break;
+    }
+
+    const data = await resp.json();
+    const tweets = data.tweets || [];
+    allTweets = allTweets.concat(tweets);
+
+    if (!data.has_more || !data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+
+  return allTweets;
+}
+
+async function fetchTwitterAPIPages(query, apiKey, maxPages = 5) {
+  let allTweets = [];
+  let cursor = "";
+
+  for (let i = 0; i < maxPages; i++) {
+    const url = `https://api.twitterapi.io/twitter/tweet/advanced_search?query=${encodeURIComponent(query)}&queryType=Latest&cursor=${encodeURIComponent(cursor)}`;
+    const resp = await fetch(url, { headers: { "X-API-Key": apiKey } });
+
+    if (!resp.ok) {
+      if (i === 0) {
+        const errText = await resp.text();
+        throw new Error(`TwitterAPI.io error ${resp.status}: ${errText}`);
+      }
+      break;
+    }
+
+    const data = await resp.json();
+    const tweets = data.tweets || [];
+    allTweets = allTweets.concat(tweets);
+
+    if (!data.has_next_page && !data.has_more) break;
+    if (!data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+
+  return allTweets;
+}
+
+function normalizeTweets(rawTweets) {
+  return rawTweets.map((t) => ({
+    text: t.text || t.full_text || "",
+    user: t.author?.userName || t.user?.screen_name || t.author?.username || "anon",
+    user_display: t.author?.name || t.user?.name || "",
+    followers: t.author?.followers || t.author?.followersCount || t.user?.followers_count || 0,
+    likes: t.likeCount || t.favorite_count || t.public_metrics?.like_count || 0,
+    retweets: t.retweetCount || t.retweet_count || t.public_metrics?.retweet_count || 0,
+    views: t.viewCount || t.view_count || t.public_metrics?.impression_count || 0,
+    replies: t.replyCount || t.reply_count || t.public_metrics?.reply_count || 0,
+    created_at: t.createdAt || t.created_at || "",
+    url: t.url || t.twitterUrl || (t.id ? `https://x.com/${t.author?.userName || t.user?.screen_name || "i"}/status/${t.id}` : ""),
+  }));
+}
 
 app.post("/api/tweets", async (req, res) => {
   const { cashtag, provider, apiKey } = req.body;
@@ -24,27 +91,15 @@ app.post("/api/tweets", async (req, res) => {
   const query = cashtag.startsWith("$") ? cashtag : `$${cashtag}`;
 
   try {
-    let resp;
-
+    let rawTweets;
     if (provider === "getxapi") {
-      resp = await fetch(
-        `https://api.getxapi.com/twitter/tweet/advanced_search?q=${encodeURIComponent(query)}&product=Latest`,
-        { headers: { Authorization: `Bearer ${apiKey}` } }
-      );
+      rawTweets = await fetchGetXAPIPages(query, apiKey, 5);
     } else {
-      resp = await fetch(
-        `https://api.twitterapi.io/twitter/tweet/advanced_search?query=${encodeURIComponent(query)}&queryType=Latest&cursor=`,
-        { headers: { "X-API-Key": apiKey } }
-      );
+      rawTweets = await fetchTwitterAPIPages(query, apiKey, 5);
     }
 
-    if (!resp.ok) {
-      const errText = await resp.text();
-      return res.status(resp.status).json({ error: `${provider} error ${resp.status}: ${errText}` });
-    }
-
-    const data = await resp.json();
-    res.json(data);
+    const tweets = normalizeTweets(rawTweets);
+    res.json({ tweets, total: tweets.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -85,7 +140,6 @@ app.post("/api/analyze", async (req, res) => {
   }
 });
 
-// SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(join(__dirname, "dist", "index.html"));
 });
