@@ -15,8 +15,6 @@ const DEGEN_LOADING_MSGS = [
   "measuring conviction levels...",
 ];
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractJSON(text) {
@@ -32,45 +30,31 @@ function extractJSON(text) {
   return null;
 }
 
-// ── Twitter API fetchers ─────────────────────────────────────────────────────
+// ── Twitter API (via proxy) ──────────────────────────────────────────────────
 
-async function fetchTweetsGetXAPI(cashtag, apiKey) {
-  const query = cashtag.startsWith("$") ? cashtag : `$${cashtag}`;
-  const resp = await fetch(
-    `https://api.getxapi.com/v1/search/tweets?query=${encodeURIComponent(query)}&count=40`,
-    { headers: { Authorization: `Bearer ${apiKey}` } }
-  );
-  if (!resp.ok) throw new Error(`GetXAPI error ${resp.status}: ${await resp.text()}`);
+async function fetchTweets(cashtag, provider, apiKey) {
+  const resp = await fetch("/api/tweets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cashtag, provider, apiKey }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+    throw new Error(err.error || `Twitter API error ${resp.status}`);
+  }
   const data = await resp.json();
   const tweets = data.tweets || data.data || data.results || [];
-  return tweets.map((t) => ({
-    text: t.text || t.full_text || "",
-    user: t.user?.screen_name || t.author?.username || "anon",
-    likes: t.favorite_count || t.public_metrics?.like_count || 0,
-    retweets: t.retweet_count || t.public_metrics?.retweet_count || 0,
-    created_at: t.created_at || "",
-  }));
-}
 
-async function fetchTweetsTwitterAPI(cashtag, apiKey) {
-  const query = cashtag.startsWith("$") ? cashtag : `$${cashtag}`;
-  const resp = await fetch(
-    `https://api.twitterapi.io/twitter/tweet/advanced_search?query=${encodeURIComponent(query)}&queryType=Latest&cursor=`,
-    { headers: { "X-API-Key": apiKey } }
-  );
-  if (!resp.ok) throw new Error(`TwitterAPI.io error ${resp.status}: ${await resp.text()}`);
-  const data = await resp.json();
-  const tweets = data.tweets || data.data || data.results || [];
   return tweets.map((t) => ({
     text: t.text || t.full_text || "",
-    user: t.author?.userName || t.user?.screen_name || "anon",
-    likes: t.likeCount || t.favorite_count || 0,
-    retweets: t.retweetCount || t.retweet_count || 0,
+    user: t.author?.userName || t.user?.screen_name || t.author?.username || "anon",
+    likes: t.likeCount || t.favorite_count || t.public_metrics?.like_count || 0,
+    retweets: t.retweetCount || t.retweet_count || t.public_metrics?.retweet_count || 0,
     created_at: t.createdAt || t.created_at || "",
   }));
 }
 
-// ── LLM Analysis ─────────────────────────────────────────────────────────────
+// ── LLM Analysis (via proxy) ─────────────────────────────────────────────────
 
 async function analyzeTweets(tweets, cashtag, openrouterKey) {
   const tweetBlock = tweets
@@ -94,26 +78,21 @@ RESPOND WITH ONLY valid JSON, no markdown, no backticks, no preamble. The JSON m
 For related_cashtags: find ALL other $CASHTAGS mentioned in the tweets (besides the searched one). Rank by frequency. Include at least the top 5 if available.
 For notable_tweets: pick 2-4 tweets that stand out — high engagement, controversial takes, alpha, or key influencer posts.`;
 
-  const resp = await fetch(OPENROUTER_URL, {
+  const resp = await fetch("/api/analyze", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${openrouterKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": window.location.href,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "auto",
+      apiKey: openrouterKey,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: `Analyze these tweets about ${cashtag}:\n\n${tweetBlock}` },
       ],
-      temperature: 0.3,
     }),
   });
 
   if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`OpenRouter error ${resp.status}: ${errText}`);
+    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+    throw new Error(err.error || `OpenRouter error ${resp.status}`);
   }
 
   const data = await resp.json();
@@ -413,8 +392,7 @@ export default function App() {
     startLoadingMsgs();
 
     try {
-      const fetchFn = config.twitterProvider === "getxapi" ? fetchTweetsGetXAPI : fetchTweetsTwitterAPI;
-      const tweets = await fetchFn(tag, config.twitterKey);
+      const tweets = await fetchTweets(tag, config.twitterProvider, config.twitterKey);
 
       if (!tweets || tweets.length === 0) {
         throw new Error("No tweets found for this cashtag. Try another one or check your API key.");
