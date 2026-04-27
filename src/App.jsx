@@ -111,26 +111,42 @@ async function fetchTweets(cashtag, provider, apiKey) {
 // ── LLM Analysis (via proxy) ─────────────────────────────────────────────────
 
 async function analyzeTweets(tweets, cashtag, openrouterKey) {
-  const tweetBlock = tweets
-    .slice(0, 60)
+  // Sort by engagement, pick top 10 for fast analysis
+  const topTweets = [...tweets]
+    .sort((a, b) => (b.likes + b.retweets * 2 + b.views * 0.01) - (a.likes + a.retweets * 2 + a.views * 0.01))
+    .slice(0, 10);
+
+  const tweetBlock = topTweets
     .map((t, i) => `[${i + 1}] @${t.user} (${formatNum(t.followers)} followers, ${t.likes}❤ ${t.retweets}🔁 ${formatNum(t.views)} views): ${t.text}`)
     .join("\n");
 
-  const systemPrompt = `You are a crypto twitter (CT) analyst. You analyze tweets about a cashtag and produce structured JSON output. You speak the language of crypto twitter — concise, direct, degen-aware. No fluff.
+  // Also extract all cashtags from ALL tweets for accurate related cashtags
+  const allCashtagsRaw = tweets.flatMap((t) => (t.text.match(/\$[A-Za-z]{1,10}/g) || []));
+  const searchedTag = cashtag.toUpperCase();
+  const cashtagCounts = {};
+  allCashtagsRaw.forEach((tag) => {
+    const upper = tag.toUpperCase();
+    if (upper !== searchedTag) {
+      cashtagCounts[upper] = (cashtagCounts[upper] || 0) + 1;
+    }
+  });
+  const relatedTagsSummary = Object.entries(cashtagCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15)
+    .map(([tag, count]) => `${tag}: ${count}`)
+    .join(", ");
 
-RESPOND WITH ONLY valid JSON, no markdown, no backticks, no preamble. The JSON must match this schema exactly:
+  const systemPrompt = `You are a crypto twitter analyst. Analyze tweets and return ONLY valid JSON (no markdown, no backticks). Schema:
 {
-  "summary": "string — 3-5 sentence summary of what CT is saying about this cashtag. Mention key narratives, notable claims, hype level, and whether sentiment is bullish/bearish/mixed.",
-  "sentiment": "number between 0 and 100 — 0 = extreme bear, 50 = neutral, 100 = extreme bull",
-  "sentiment_label": "string — one of: 'Extreme Fear', 'Bearish', 'Slightly Bearish', 'Neutral', 'Slightly Bullish', 'Bullish', 'Extreme Greed'",
-  "key_narratives": ["string array — 2-5 dominant narratives or talking points"],
-  "related_cashtags": [{"tag": "$XXX", "count": number, "context": "short string explaining why it appears alongside"}],
-  "notable_tweets": [{"user": "@handle", "text": "tweet text summary (keep short)", "why": "why it's notable", "index": number}],
-  "hype_level": "string — one of: 'Dead', 'Low', 'Moderate', 'High', 'Ape-in Territory', 'Full Degen Mode'"
+  "summary": "2-3 sentences: sentiment, key narratives, hype level",
+  "sentiment": 0-100,
+  "sentiment_label": "Extreme Fear|Bearish|Slightly Bearish|Neutral|Slightly Bullish|Bullish|Extreme Greed",
+  "key_narratives": ["2-4 short strings"],
+  "related_cashtags": [{"tag": "$XXX", "count": N, "context": "why"}],
+  "notable_tweets": [{"user": "@handle", "text": "short summary", "why": "why notable", "index": N}],
+  "hype_level": "Dead|Low|Moderate|High|Ape-in Territory|Full Degen Mode"
 }
-
-For related_cashtags: find ALL other $CASHTAGS mentioned in the tweets (besides the searched one). Rank by frequency. Include at least the top 5 if available.
-For notable_tweets: pick 3-5 tweets that stand out — high engagement, controversial takes, alpha, or key influencer posts. Include the index number from the tweet list so we can link to them.`;
+Use the related cashtag counts provided. For notable_tweets use index numbers from the tweet list.`;
 
   const resp = await fetch("/api/analyze", {
     method: "POST",
@@ -139,7 +155,7 @@ For notable_tweets: pick 3-5 tweets that stand out — high engagement, controve
       apiKey: openrouterKey,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `Analyze these tweets about ${cashtag}:\n\n${tweetBlock}` },
+        { role: "user", content: `Analyze top tweets about ${cashtag}:\n\n${tweetBlock}\n\nRelated cashtag counts from all ${tweets.length} tweets: ${relatedTagsSummary || "none found"}` },
       ],
     }),
   });
@@ -153,7 +169,22 @@ For notable_tweets: pick 3-5 tweets that stand out — high engagement, controve
   const raw = data.choices?.[0]?.message?.content || "";
   const parsed = extractJSON(raw);
   if (!parsed) throw new Error("Failed to parse LLM response. Raw output:\n" + raw.slice(0, 500));
-  return { ...parsed, _model: data.model || "openrouter/free" };
+
+  // Map notable tweet indices back to topTweets (which have URLs, etc.)
+  if (parsed.notable_tweets) {
+    parsed.notable_tweets = parsed.notable_tweets.map((nt) => {
+      const idx = (nt.index || 0) - 1;
+      const real = topTweets[idx];
+      return {
+        ...nt,
+        url: real?.url || "",
+        followers: real?.followers || 0,
+        created_at: real?.created_at || "",
+      };
+    });
+  }
+
+  return { ...parsed, _model: data.model || "openrouter/free", _topTweets: topTweets };
 }
 
 // ── Components ───────────────────────────────────────────────────────────────
@@ -295,15 +326,10 @@ function SettingsPanel({ config, setConfig, onClose }) {
   );
 }
 
-function ResultsView({ result, tweets }) {
+function ResultsView({ result }) {
   if (!result) return null;
 
-  // Map notable tweet indices to actual tweet data for URLs
-  const notableTweetsWithLinks = (result.notable_tweets || []).map((nt) => {
-    const idx = (nt.index || 0) - 1;
-    const real = tweets[idx];
-    return { ...nt, url: real?.url || "", followers: real?.followers || 0, created_at: real?.created_at || "" };
-  });
+  const notableTweets = result.notable_tweets || [];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
@@ -368,10 +394,10 @@ function ResultsView({ result, tweets }) {
       )}
 
       {/* Notable Tweets — with links, dates, followers */}
-      {notableTweetsWithLinks.length > 0 && (
+      {notableTweets.length > 0 && (
         <Card title="NOTABLE TWEETS">
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            {notableTweetsWithLinks.map((tw, i) => (
+            {notableTweets.map((tw, i) => (
               <div key={i} style={{ borderLeft: "2px solid var(--accent)", paddingLeft: 14 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 4 }}>
                   <span style={{ fontFamily: "var(--mono)", fontSize: 13, color: "var(--accent)", fontWeight: 600 }}>
@@ -705,7 +731,7 @@ export default function App() {
               </div>
             </Card>
 
-            <ResultsView result={result} tweets={tweets} />
+            <ResultsView result={result} />
           </div>
         )}
 
