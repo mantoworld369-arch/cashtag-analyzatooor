@@ -1,0 +1,27 @@
+# Option A: subdomain (e.g. cashtag.yourdomain.com)
+server {
+    listen 80;
+    server_name cashtag.yourdomain.com;
+
+    root /var/www/cashtag-analyzatooor/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Optional: gzip
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+}
+
+# Option B: path-based (e.g. yourdomain.com/cashtag/)
+# Add this inside your existing server block:
+#
+# location /cashtag/ {
+#     alias /var/www/cashtag-analyzatooor/dist/;
+#     try_files $uri $uri/ /cashtag/index.html;
+# }
+#
+# If using path-based, also update vite.config.js:
+#   base: '/cashtag/',
