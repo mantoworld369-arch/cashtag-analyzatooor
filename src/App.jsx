@@ -348,10 +348,12 @@ const cardTitleStyle = {
 // ── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [config, setConfig] = useState({
-    twitterProvider: "twitterapi",
-    twitterKey: "",
-    openrouterKey: "",
+  const [config, setConfig] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("cashtag_config"));
+      if (saved) return { twitterProvider: saved.twitterProvider || "twitterapi", twitterKey: saved.twitterKey || "", openrouterKey: saved.openrouterKey || "" };
+    } catch {}
+    return { twitterProvider: "twitterapi", twitterKey: "", openrouterKey: "" };
   });
   const [showSettings, setShowSettings] = useState(false);
   const [cashtag, setCashtag] = useState("");
@@ -362,6 +364,10 @@ export default function App() {
   const [tweetCount, setTweetCount] = useState(0);
   const [history, setHistory] = useState([]);
   const loadingInterval = useRef(null);
+
+  useEffect(() => {
+    try { localStorage.setItem("cashtag_config", JSON.stringify(config)); } catch {}
+  }, [config]);
 
   const startLoadingMsgs = useCallback(() => {
     let idx = 0;
