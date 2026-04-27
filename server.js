@@ -67,7 +67,7 @@ app.post("/api/analyze", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "auto",
+        model: "openrouter/free",
         messages,
         temperature: 0.3,
       }),
