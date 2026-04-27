@@ -13,6 +13,8 @@ const DEGEN_LOADING_MSGS = [
   "analyzing bag holders...",
   "checking who's fading...",
   "measuring conviction levels...",
+  "paginating through CT...",
+  "fetching page 2... 3... 4...",
 ];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -30,6 +32,66 @@ function extractJSON(text) {
   return null;
 }
 
+function timeAgo(dateStr) {
+  if (!dateStr) return "";
+  const d = new Date(dateStr);
+  if (isNaN(d)) return dateStr;
+  const now = new Date();
+  const diffMs = now - d;
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return d.toLocaleDateString();
+}
+
+function formatNum(n) {
+  if (!n || n === 0) return "0";
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+  return n.toString();
+}
+
+function computeStats(tweets) {
+  const now = new Date();
+  const oneHourAgo = new Date(now - 60 * 60 * 1000);
+  const oneDayAgo = new Date(now - 24 * 60 * 60 * 1000);
+  const oneWeekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+  let mentions1h = 0, mentions24h = 0, mentions7d = 0;
+  let totalViews = 0, viewCount = 0;
+  let totalLikes = 0, totalRetweets = 0;
+
+  tweets.forEach((t) => {
+    const d = new Date(t.created_at);
+    if (!isNaN(d)) {
+      if (d >= oneHourAgo) mentions1h++;
+      if (d >= oneDayAgo) mentions24h++;
+      if (d >= oneWeekAgo) mentions7d++;
+    }
+    if (t.views > 0) {
+      totalViews += t.views;
+      viewCount++;
+    }
+    totalLikes += t.likes || 0;
+    totalRetweets += t.retweets || 0;
+  });
+
+  return {
+    mentions1h,
+    mentions24h,
+    mentions7d,
+    totalTweets: tweets.length,
+    avgViews: viewCount > 0 ? Math.round(totalViews / viewCount) : 0,
+    totalViews,
+    totalLikes,
+    totalRetweets,
+  };
+}
+
 // ── Twitter API (via proxy) ──────────────────────────────────────────────────
 
 async function fetchTweets(cashtag, provider, apiKey) {
@@ -43,23 +105,15 @@ async function fetchTweets(cashtag, provider, apiKey) {
     throw new Error(err.error || `Twitter API error ${resp.status}`);
   }
   const data = await resp.json();
-  const tweets = data.tweets || data.data || data.results || [];
-
-  return tweets.map((t) => ({
-    text: t.text || t.full_text || "",
-    user: t.author?.userName || t.user?.screen_name || t.author?.username || "anon",
-    likes: t.likeCount || t.favorite_count || t.public_metrics?.like_count || 0,
-    retweets: t.retweetCount || t.retweet_count || t.public_metrics?.retweet_count || 0,
-    created_at: t.createdAt || t.created_at || "",
-  }));
+  return data.tweets || [];
 }
 
 // ── LLM Analysis (via proxy) ─────────────────────────────────────────────────
 
 async function analyzeTweets(tweets, cashtag, openrouterKey) {
   const tweetBlock = tweets
-    .slice(0, 50)
-    .map((t, i) => `[${i + 1}] @${t.user} (${t.likes}❤ ${t.retweets}🔁): ${t.text}`)
+    .slice(0, 60)
+    .map((t, i) => `[${i + 1}] @${t.user} (${formatNum(t.followers)} followers, ${t.likes}❤ ${t.retweets}🔁 ${formatNum(t.views)} views): ${t.text}`)
     .join("\n");
 
   const systemPrompt = `You are a crypto twitter (CT) analyst. You analyze tweets about a cashtag and produce structured JSON output. You speak the language of crypto twitter — concise, direct, degen-aware. No fluff.
@@ -71,12 +125,12 @@ RESPOND WITH ONLY valid JSON, no markdown, no backticks, no preamble. The JSON m
   "sentiment_label": "string — one of: 'Extreme Fear', 'Bearish', 'Slightly Bearish', 'Neutral', 'Slightly Bullish', 'Bullish', 'Extreme Greed'",
   "key_narratives": ["string array — 2-5 dominant narratives or talking points"],
   "related_cashtags": [{"tag": "$XXX", "count": number, "context": "short string explaining why it appears alongside"}],
-  "notable_tweets": [{"user": "@handle", "text": "tweet text summary (keep short)", "why": "why it's notable"}],
+  "notable_tweets": [{"user": "@handle", "text": "tweet text summary (keep short)", "why": "why it's notable", "index": number}],
   "hype_level": "string — one of: 'Dead', 'Low', 'Moderate', 'High', 'Ape-in Territory', 'Full Degen Mode'"
 }
 
 For related_cashtags: find ALL other $CASHTAGS mentioned in the tweets (besides the searched one). Rank by frequency. Include at least the top 5 if available.
-For notable_tweets: pick 2-4 tweets that stand out — high engagement, controversial takes, alpha, or key influencer posts.`;
+For notable_tweets: pick 3-5 tweets that stand out — high engagement, controversial takes, alpha, or key influencer posts. Include the index number from the tweet list so we can link to them.`;
 
   const resp = await fetch("/api/analyze", {
     method: "POST",
@@ -99,10 +153,38 @@ For notable_tweets: pick 2-4 tweets that stand out — high engagement, controve
   const raw = data.choices?.[0]?.message?.content || "";
   const parsed = extractJSON(raw);
   if (!parsed) throw new Error("Failed to parse LLM response. Raw output:\n" + raw.slice(0, 500));
-  return { ...parsed, _model: data.model || "auto" };
+  return { ...parsed, _model: data.model || "openrouter/free" };
 }
 
-// ── Reusable Components ──────────────────────────────────────────────────────
+// ── Components ───────────────────────────────────────────────────────────────
+
+function StatBox({ label, value, sub }) {
+  return (
+    <div style={{
+      flex: "1 1 0", minWidth: 80, padding: "14px 10px", textAlign: "center",
+      background: "#0c0c14", border: "1px solid #1a1a2e", borderRadius: 10,
+    }}>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 22, fontWeight: 700, color: "var(--accent)", textShadow: "0 0 10px rgba(0,255,136,0.2)" }}>
+        {value}
+      </div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#555", marginTop: 4, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+        {label}
+      </div>
+      {sub && <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#333", marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function StatsBar({ stats }) {
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <StatBox label="Past 1h" value={stats.mentions1h} />
+      <StatBox label="Past 24h" value={stats.mentions24h} />
+      <StatBox label="Past 7d" value={stats.mentions7d} />
+      <StatBox label="Avg Views" value={formatNum(stats.avgViews)} sub={`${formatNum(stats.totalViews)} total`} />
+    </div>
+  );
+}
 
 function SentimentGauge({ value = 50, label = "Neutral" }) {
   const clamp = Math.max(0, Math.min(100, value));
@@ -164,7 +246,6 @@ function SettingsPanel({ config, setConfig, onClose }) {
           <button onClick={onClose} style={{ background: "none", border: "none", color: "#555", fontSize: 20, cursor: "pointer" }}>✕</button>
         </div>
 
-        {/* Twitter Provider */}
         <label style={labelStyle}>Twitter API Provider</label>
         <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
           {[
@@ -185,23 +266,20 @@ function SettingsPanel({ config, setConfig, onClose }) {
           ))}
         </div>
 
-        {/* Twitter Key */}
         <label style={labelStyle}>Twitter API Key</label>
         <input value={local.twitterKey}
           onChange={(e) => setLocal((s) => ({ ...s, twitterKey: e.target.value }))}
           type="password" placeholder="paste your key here" style={{ ...inputStyle, marginBottom: 20 }} />
 
-        {/* OpenRouter Key */}
         <label style={labelStyle}>OpenRouter API Key</label>
         <input value={local.openrouterKey}
           onChange={(e) => setLocal((s) => ({ ...s, openrouterKey: e.target.value }))}
           type="password" placeholder="sk-or-..." style={inputStyle} />
 
         <p style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#333", margin: "8px 0 0" }}>
-          Keys are stored in memory only — never sent anywhere except their respective APIs.
+          Keys saved in browser localStorage — set once, use forever.
         </p>
 
-        {/* Actions */}
         <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
           <button onClick={() => { setConfig(local); onClose(); }}
             style={{ ...btnPrimary, flex: 1 }}>
@@ -217,8 +295,15 @@ function SettingsPanel({ config, setConfig, onClose }) {
   );
 }
 
-function ResultsView({ result }) {
+function ResultsView({ result, tweets }) {
   if (!result) return null;
+
+  // Map notable tweet indices to actual tweet data for URLs
+  const notableTweetsWithLinks = (result.notable_tweets || []).map((nt) => {
+    const idx = (nt.index || 0) - 1;
+    const real = tweets[idx];
+    return { ...nt, url: real?.url || "", followers: real?.followers || 0, created_at: real?.created_at || "" };
+  });
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
@@ -282,20 +367,48 @@ function ResultsView({ result }) {
         </Card>
       )}
 
-      {/* Notable Tweets */}
-      {result.notable_tweets?.length > 0 && (
+      {/* Notable Tweets — with links, dates, followers */}
+      {notableTweetsWithLinks.length > 0 && (
         <Card title="NOTABLE TWEETS">
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {result.notable_tweets.map((tw, i) => (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {notableTweetsWithLinks.map((tw, i) => (
               <div key={i} style={{ borderLeft: "2px solid var(--accent)", paddingLeft: 14 }}>
-                <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--accent)", marginBottom: 4 }}>
-                  {tw.user}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 4 }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 13, color: "var(--accent)", fontWeight: 600 }}>
+                    {tw.user}
+                  </span>
+                  {tw.followers > 0 && (
+                    <span style={{ fontSize: 10, color: "#555", fontFamily: "var(--mono)" }}>
+                      {formatNum(tw.followers)} followers
+                    </span>
+                  )}
+                  {tw.created_at && (
+                    <span style={{ fontSize: 10, color: "#444", fontFamily: "var(--mono)" }}>
+                      · {timeAgo(tw.created_at)}
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontSize: 13, color: "#bbb", lineHeight: 1.6, fontFamily: "var(--body)" }}>
                   {tw.text}
                 </div>
-                <div style={{ fontSize: 11, color: "#555", marginTop: 4, fontStyle: "italic", fontFamily: "var(--body)" }}>
-                  {tw.why}
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 6 }}>
+                  <span style={{ fontSize: 11, color: "#555", fontStyle: "italic", fontFamily: "var(--body)", flex: 1 }}>
+                    {tw.why}
+                  </span>
+                  {tw.url && (
+                    <a href={tw.url} target="_blank" rel="noopener noreferrer"
+                      style={{
+                        fontSize: 10, color: "#0af", fontFamily: "var(--mono)",
+                        textDecoration: "none", border: "1px solid #0af3", borderRadius: 4,
+                        padding: "2px 8px", whiteSpace: "nowrap",
+                        transition: "all 0.2s",
+                      }}
+                      onMouseOver={(e) => { e.target.style.background = "rgba(0,170,255,0.1)"; }}
+                      onMouseOut={(e) => { e.target.style.background = "transparent"; }}
+                    >
+                      view tweet ↗
+                    </a>
+                  )}
                 </div>
               </div>
             ))}
@@ -361,7 +474,8 @@ export default function App() {
   const [loadingMsg, setLoadingMsg] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
-  const [tweetCount, setTweetCount] = useState(0);
+  const [tweets, setTweets] = useState([]);
+  const [stats, setStats] = useState(null);
   const [history, setHistory] = useState([]);
   const loadingInterval = useRef(null);
 
@@ -375,7 +489,7 @@ export default function App() {
     loadingInterval.current = setInterval(() => {
       idx = (idx + 1) % DEGEN_LOADING_MSGS.length;
       setLoadingMsg(DEGEN_LOADING_MSGS[idx]);
-    }, 2000);
+    }, 1800);
   }, []);
 
   const stopLoadingMsgs = useCallback(() => {
@@ -394,19 +508,23 @@ export default function App() {
     setLoading(true);
     setError("");
     setResult(null);
-    setTweetCount(0);
+    setTweets([]);
+    setStats(null);
     startLoadingMsgs();
 
     try {
-      const tweets = await fetchTweets(tag, config.twitterProvider, config.twitterKey);
+      const fetchedTweets = await fetchTweets(tag, config.twitterProvider, config.twitterKey);
 
-      if (!tweets || tweets.length === 0) {
+      if (!fetchedTweets || fetchedTweets.length === 0) {
         throw new Error("No tweets found for this cashtag. Try another one or check your API key.");
       }
-      setTweetCount(tweets.length);
+
+      setTweets(fetchedTweets);
+      const tweetStats = computeStats(fetchedTweets);
+      setStats(tweetStats);
       setLoadingMsg("running AI analysis...");
 
-      const analysis = await analyzeTweets(tweets, tag, config.openrouterKey);
+      const analysis = await analyzeTweets(fetchedTweets, tag, config.openrouterKey);
       setResult(analysis);
       setHistory((h) => [tag, ...h.filter((t) => t !== tag)].slice(0, 10));
     } catch (err) {
@@ -440,6 +558,7 @@ export default function App() {
         input:focus { border-color: var(--accent) !important; box-shadow: 0 0 16px rgba(0,255,136,0.06); }
         button:hover:not(:disabled) { filter: brightness(1.15); }
         button:active:not(:disabled) { transform: scale(0.98); }
+        a:hover { filter: brightness(1.3); }
 
         .scanline {
           position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -468,7 +587,7 @@ export default function App() {
               fontFamily: "var(--mono)", fontSize: 11, color: "#333",
               marginTop: 8, letterSpacing: "0.08em",
             }}>
-              sentiment · narratives · related tickers
+              sentiment · narratives · related tickers · stats
             </p>
           </div>
           <button onClick={() => setShowSettings(true)}
@@ -549,9 +668,9 @@ export default function App() {
             <p style={{ fontFamily: "var(--mono)", fontSize: 13, color: "var(--accent)", letterSpacing: "0.04em" }}>
               {loadingMsg}
             </p>
-            {tweetCount > 0 && (
+            {tweets.length > 0 && (
               <p style={{ fontFamily: "var(--mono)", fontSize: 11, color: "#333", marginTop: 8 }}>
-                fetched {tweetCount} tweets
+                fetched {tweets.length} tweets — analyzing...
               </p>
             )}
           </Card>
@@ -567,12 +686,26 @@ export default function App() {
         )}
 
         {/* Results */}
-        {result && !loading && (
+        {stats && !loading && (
           <div style={{ animation: "fadeIn 0.4s ease-out" }}>
             <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "#333", marginTop: 18, textAlign: "right" }}>
-              {tweetCount} tweets analyzed
+              {tweets.length} tweets fetched
             </div>
-            <ResultsView result={result} />
+
+            {/* Stats Bar */}
+            <Card title="TICKER STATS" style={{ marginTop: 8 }}>
+              <StatsBar stats={stats} />
+              <div style={{ display: "flex", gap: 16, marginTop: 12, justifyContent: "center" }}>
+                <span style={{ fontSize: 11, color: "#555", fontFamily: "var(--mono)" }}>
+                  ❤ {formatNum(stats.totalLikes)} likes
+                </span>
+                <span style={{ fontSize: 11, color: "#555", fontFamily: "var(--mono)" }}>
+                  🔁 {formatNum(stats.totalRetweets)} RTs
+                </span>
+              </div>
+            </Card>
+
+            <ResultsView result={result} tweets={tweets} />
           </div>
         )}
 
