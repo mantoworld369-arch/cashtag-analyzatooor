@@ -28,7 +28,7 @@ app.post("/api/tweets", async (req, res) => {
 
     if (provider === "getxapi") {
       resp = await fetch(
-        `https://api.getxapi.com/v1/search/tweets?query=${encodeURIComponent(query)}&count=40`,
+        `https://api.getxapi.com/twitter/tweet/advanced_search?q=${encodeURIComponent(query)}&product=Latest`,
         { headers: { Authorization: `Bearer ${apiKey}` } }
       );
     } else {
